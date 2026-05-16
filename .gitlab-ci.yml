@@ -440,6 +440,13 @@ release:
     - echo "VERSION=$VERSION IS_PRE=$IS_PRE"
     # Upload every asset to the generic registry and build the asset-links
     # array as we go.
+    #
+    # Each --assets-link JSON sets:
+    #   url       → the actual Generic Package Registry download URL.
+    #   filepath  → makes the friendly /-/releases/<tag>/downloads/<name>
+    #               shortcut work; GitLab redirects it to `url`.
+    # Without `filepath` the /downloads/<name> URL 404s — the release page
+    # would only show the long /api/v4/... URL in the Assets section.
     - LINKS=""
     - |
       for f in assets/*; do
@@ -449,7 +456,7 @@ release:
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
           --upload-file "$f" \
           "${PKG_BASE}/${name}"
-        LINKS="${LINKS} --assets-link {\"name\":\"${name}\",\"url\":\"${DL_BASE}/${name}\",\"link_type\":\"package\"}"
+        LINKS="${LINKS} --assets-link {\"name\":\"${name}\",\"url\":\"${PKG_BASE}/${name}\",\"filepath\":\"/${name}\",\"link_type\":\"package\"}"
       done
     # Build the release body — mirrors the Downloads table the GitHub
     # workflow emits, but pointing at GitLab's release-download URLs.
