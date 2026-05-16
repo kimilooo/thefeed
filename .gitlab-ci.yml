@@ -221,13 +221,48 @@ android-apk:
   image: eclipse-temurin:17-jdk
   variables:
     GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+    # Bump these when the project's compileSdk / build-tools change — the
+    # cache key below is derived from them so any bump invalidates the
+    # cached SDK and a fresh one is installed.
+    ANDROID_PLATFORM: "35"
+    ANDROID_BUILD_TOOLS: "35.0.0"
+    ANDROID_SDK_ROOT: "$CI_PROJECT_DIR/.android-sdk"
+    ANDROID_HOME: "$CI_PROJECT_DIR/.android-sdk"
   cache:
-    key: gradle
-    paths:
-      - .gradle/caches
-      - .gradle/wrapper
+    - key: "gradle"
+      paths:
+        - .gradle/caches
+        - .gradle/wrapper
+      policy: pull-push
+    - key: "android-sdk-p${ANDROID_PLATFORM}-bt${ANDROID_BUILD_TOOLS}"
+      paths: [.android-sdk/]
+      policy: pull-push
   before_script:
     - apt-get update -qq && apt-get install -y -qq curl unzip
+    # Install Android cmdline-tools + SDK platform + build-tools if missing.
+    # sdkmanager is Java-based and this image already ships Temurin 17, so
+    # no extra JDK install is needed.
+    - |
+      if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+        echo "Installing Android cmdline-tools (cache miss)…"
+        mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+        curl -sSL -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+        unzip -q /tmp/clt.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+        mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+        rm /tmp/clt.zip
+      else
+        echo "Reusing cached Android cmdline-tools."
+      fi
+    - export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+    - |
+      if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}" ] \
+         || [ ! -d "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}" ]; then
+        echo "Installing SDK platform-${ANDROID_PLATFORM} + build-tools ${ANDROID_BUILD_TOOLS} (cache miss)…"
+        yes | sdkmanager --licenses >/dev/null
+        sdkmanager "platform-tools" "platforms;android-${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null
+      else
+        echo "Reusing cached SDK platform-${ANDROID_PLATFORM} + build-tools ${ANDROID_BUILD_TOOLS}."
+      fi
   script:
     - mkdir -p android/app/src/main/jniLibs/arm64-v8a
     - mkdir -p android/app/src/main/jniLibs/armeabi-v7a
