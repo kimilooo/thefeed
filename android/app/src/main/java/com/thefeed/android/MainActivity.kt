@@ -53,6 +53,12 @@ class MainActivity : ComponentActivity() {
         fileChooserCallback = null
     }
 
+    // HTML5 video fullscreen support: WebView calls onShowCustomView when
+    // the page enters fullscreen and onHideCustomView when it exits. Without
+    // these the native player's fullscreen button stays greyed out.
+    private var fullscreenView: View? = null
+    private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
+
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* granted or not, service still works */ }
@@ -283,6 +289,33 @@ class MainActivity : ComponentActivity() {
                     .setOnCancelListener { result?.cancel() }
                     .show()
                 return true
+            }
+
+            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (view == null || fullscreenView != null) {
+                    callback?.onCustomViewHidden()
+                    return
+                }
+                fullscreenView = view
+                fullscreenCallback = callback
+                val decor = window.decorView as android.view.ViewGroup
+                decor.addView(view, android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+                WindowCompat.getInsetsController(window, view).apply {
+                    systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    hide(WindowInsetsCompat.Type.systemBars())
+                }
+            }
+
+            override fun onHideCustomView() {
+                val v = fullscreenView ?: return
+                val decor = window.decorView as android.view.ViewGroup
+                decor.removeView(v)
+                WindowCompat.getInsetsController(window, webView).show(WindowInsetsCompat.Type.systemBars())
+                fullscreenView = null
+                fullscreenCallback?.onCustomViewHidden()
+                fullscreenCallback = null
             }
         }
 

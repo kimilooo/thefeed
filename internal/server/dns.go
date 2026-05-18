@@ -225,13 +225,20 @@ func (s *DNSServer) handleQuery(w dns.ResponseWriter, r *dns.Msg) {
 			Name:   q.Name,
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
-			Ttl:    1,
+			Ttl:    defaultResponseTTL,
 		},
 		Txt: txtParts,
 	})
 
 	w.WriteMsg(m)
 }
+
+// defaultResponseTTL is what we put on every DNS reply. A normal-looking
+// value blends with real-world DNS — TTL=1 used to scream "non-standard
+// traffic". Random-suffix queries stay uncacheable by uniqueness; only the
+// deterministic ones (opt-in via the client setting) benefit from the
+// resolver-side cache window this enables.
+const defaultResponseTTL uint32 = 60
 
 // splitTXT splits a string into 255-byte chunks for DNS TXT records.
 func splitTXT(s string) []string {
@@ -258,7 +265,7 @@ func (s *DNSServer) writeEncodedResponse(w dns.ResponseWriter, m *dns.Msg, name 
 			Name:   name,
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
-			Ttl:    1,
+			Ttl:    defaultResponseTTL,
 		},
 		Txt: splitTXT(encoded),
 	})

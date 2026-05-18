@@ -164,11 +164,16 @@ build:
       policy: pull-push
   variables:
     CGO_ENABLED: "1"
-    # NDK r26d == 26.3.11579264. We download the zip directly from Google's
-    # CDN instead of going through sdkmanager so the job doesn't need a JDK
-    # (Debian-trixie-based golang:1.26 dropped openjdk-17 and we'd otherwise
-    # have to bring in 200MB of Java just to install one tarball).
-    ANDROID_NDK_RELEASE: "r26d"
+    # NDK r28b. r28 made -z max-page-size=16384 the default linker setting,
+    # which is required for the binary to load on Android 16 devices that
+    # use 16 KB memory pages. Earlier NDKs (r26d, r27*) produce 4 KB-aligned
+    # ELFs that the kernel refuses to mmap on 16 KB-page devices, surfacing
+    # to users as a "this app isn't supported on the latest Android version"
+    # install/launch error.
+    #
+    # We also pass an explicit -extldflags below for belt-and-suspenders so
+    # the alignment is correct even if the NDK is downgraded in future.
+    ANDROID_NDK_RELEASE: "r28b"
     ANDROID_NDK_HOME: "$CI_PROJECT_DIR/.android-ndk"
   before_script:
     - apt-get update -qq && apt-get install -y -qq curl unzip
@@ -191,7 +196,11 @@ build:
     - COMMIT=$(git rev-parse --short HEAD)
     - DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     - ASSET_TEMPLATE="thefeed-client-android-${GOARCH}"
-    - LDFLAGS="-s -w -X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE} -X github.com/sartoopjj/thefeed/internal/version.AssetTemplate=${ASSET_TEMPLATE}"
+    # -extldflags forwards a flag to the NDK clang/lld so the resulting ELF
+    # is 16 KB-aligned, which Android 16 devices require to mmap and exec
+    # the binary. NDK r28+ defaults to this, but the explicit flag keeps
+    # working if the NDK is downgraded.
+    - LDFLAGS="-s -w -X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE} -X github.com/sartoopjj/thefeed/internal/version.AssetTemplate=${ASSET_TEMPLATE} -extldflags=-Wl,-z,max-page-size=16384"
     - |
       case "$GOARCH" in
         arm64) export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" ;;
@@ -471,15 +480,20 @@ release:
     # Without `filepath` the /downloads/<name> URL 404s — the release page
     # would only show the long /api/v4/... URL in the Assets section.
     - LINKS=""
+    - rm -f checksums.txt && touch checksums.txt
     - |
       for f in assets/*; do
         name=$(basename "$f")
-        echo "Uploading $name ..."
+        sha=$(sha256sum "$f" | awk '{print $1}')
+        echo "Uploading $name (sha256=$sha)..."
         curl --fail --silent --show-error \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
           --upload-file "$f" \
           "${PKG_BASE}/${name}"
         LINKS="${LINKS} --assets-link {\"name\":\"${name}\",\"url\":\"${PKG_BASE}/${name}\",\"filepath\":\"/${name}\",\"link_type\":\"package\"}"
+        # Same format as `sha256sum -c` expects (HASH<two spaces>NAME)
+        # so users can verify with: sha256sum -c sha256sums.txt
+        printf '%s  %s\n' "$sha" "$name" >> checksums.txt
       done
     # Build the release body — mirrors the Downloads table the GitHub
     # workflow emits, but pointing at GitLab's release-download URLs.
@@ -503,6 +517,14 @@ release:
       | iOS (unsigned) | universal | [thefeed-ios-${VERSION}-unsigned.ipa](${DL_BASE}/thefeed-ios-${VERSION}-unsigned.ipa) |
 
       **iOS / iPadOS (preview, iOS 14+):** the \`.ipa\` is unsigned. Re-sign it with your own Apple ID and provisioning profile (AltStore, Sideloadly, or \`xcrun altool\` upload to your own TestFlight). It will not install directly from a download.
+
+      ## SHA-256 checksums
+
+      Verify a download with: \`sha256sum -c sha256sums.txt\` (or \`shasum -a 256 -c sha256sums.txt\` on macOS).
+
+      \`\`\`
+      $(cat checksums.txt)
+      \`\`\`
 
       Mirror: also published on GitHub at https://github.com/sartoopjj/thefeed/releases/tag/${VERSION} when the GitHub account is available.
       EOF

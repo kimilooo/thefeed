@@ -97,7 +97,15 @@ const (
 
 // Metadata holds channel 0 data: server info + channel list.
 type Metadata struct {
-	Marker           [MarkerSize]byte
+	// Marker is the 3 bytes at the start of the serialized metadata
+	// payload. Legacy encoder fills it with a random per-server marker;
+	// the extended encoder fills it with EMH magic + flags. Treat it as
+	// opaque on the wire and use PeekExtendedHeader to interpret.
+	Marker [MarkerSize]byte
+	// Timestamp is the 4 bytes immediately after Marker. Legacy encoder
+	// fills it with a unix timestamp; the extended encoder fills it with
+	// EMH block_count + content_hash. Treat it as opaque and use
+	// PeekExtendedHeader to interpret.
 	Timestamp        uint32
 	NextFetch        uint32 // unix timestamp of next server-side fetch (0 = unknown)
 	TelegramLoggedIn bool   // true if server has an active Telegram session
@@ -107,7 +115,7 @@ type Metadata struct {
 // ChannelInfo describes a single feed channel.
 type ChannelInfo struct {
 	Name        string
-	DisplayName string   // human-readable title; empty means fall back to Name
+	DisplayName string // human-readable title; empty means fall back to Name
 	Blocks      uint16
 	LastMsgID   uint32
 	ContentHash uint32   // CRC32 of serialized message data; changes on edits
@@ -132,6 +140,11 @@ func ContentHashOf(msgs []Message) uint32 {
 // SerializeMetadata encodes metadata into bytes for channel 0 blocks.
 // Format: marker(3) + timestamp(4) + nextFetch(4) + flags(1) + channelCount(2) + per-channel data
 // Per-channel: nameLen(1) + name + blocks(2) + lastMsgID(4) + contentHash(4) + chatType(1) + flags(1)
+//
+// New servers wrap the same payload with an extended header that reuses
+// the otherwise-unread Marker + Timestamp fields — see
+// EncodeMetadataExtended in metadata_ext.go. Old clients keep parsing this
+// format unchanged and just ignore those fields.
 func SerializeMetadata(m *Metadata) []byte {
 	// 3 marker + 4 timestamp + 4 nextFetch + 1 flags + 2 channel count + per-channel data
 	size := MarkerSize + 4 + 4 + 1 + 2
@@ -189,6 +202,11 @@ func SerializeMetadata(m *Metadata) []byte {
 }
 
 // ParseMetadata decodes metadata from concatenated channel 0 block data.
+//
+// New servers may embed an extended header in the Marker + Timestamp
+// fields of the same wire format — see PeekExtendedHeader for the magic
+// check. This parser ignores those fields by design; clients that care
+// about the embedded block_count / hash check them explicitly.
 func ParseMetadata(data []byte) (*Metadata, error) {
 	// Minimum: marker(3) + timestamp(4) + nextFetch(4) + flags(1) + count(2) = 14
 	if len(data) < MarkerSize+4+4+1+2 {

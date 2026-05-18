@@ -86,6 +86,19 @@ type Fetcher struct {
 	// 1 = sequential (no scatter), 2+ = fan-out (use fastest response).
 	scatter int
 
+	// Shared-resolver-cache. cacheShare gates the feature; cacheEpoch is the
+	// metadata-derived seed. Atomic so the web layer can refresh the epoch
+	// from a parallel goroutine after each metadata fetch without a lock.
+	cacheShare atomic.Bool
+	cacheEpoch atomic.Uint32
+
+	// Extended metadata state. extFailCount counts consecutive failures
+	// within the current "round"; on hitting metadataExtMaxRetries,
+	// extCooldownUntil is set so the next metadataExtCooldownDur uses the
+	// legacy fetch path only. All in-RAM, cleared on restart.
+	extFailCount     atomic.Int32
+	extCooldownUntil atomic.Int64 // unix seconds
+
 	// exchangeFn is the function used to send a DNS message to a resolver.
 	// It defaults to a real dns.Client exchange and can be replaced in tests.
 	exchangeFn func(ctx context.Context, m *dns.Msg, addr string) (*dns.Msg, time.Duration, error)
@@ -157,6 +170,38 @@ func (f *Fetcher) SetDebug(debug bool) {
 // SetQueryMode sets the DNS query encoding mode.
 func (f *Fetcher) SetQueryMode(mode protocol.QueryEncoding) {
 	f.queryMode = mode
+}
+
+// SetCacheShare toggles the shared-resolver-cache feature. When on, queries
+// to eligible channels use a deterministic suffix derived from the cache
+// epoch so public resolvers can serve identical responses across users.
+func (f *Fetcher) SetCacheShare(on bool) { f.cacheShare.Store(on) }
+
+// SetCacheEpoch updates the deterministic seed. Pass the latest Metadata
+// NextFetch (or any monotonically-advancing per-server value) after every
+// successful metadata refresh; advancing it invalidates cached responses.
+func (f *Fetcher) SetCacheEpoch(epoch uint32) { f.cacheEpoch.Store(epoch) }
+
+// encodeBlockQuery picks between the random and the deterministic encoder
+// based on the feature flag, the cached epoch, and channel eligibility.
+// No epoch (NextFetch=0) → random, to avoid sharing cache across a stale
+// or unknown server state.
+func (f *Fetcher) encodeBlockQuery(channel, block uint16) (string, error) {
+	share := f.cacheShare.Load()
+	eligible := protocol.ChannelEligibleForSharedCache(channel)
+	epoch := f.cacheEpoch.Load()
+	if share && eligible && epoch != 0 {
+		var seed [4]byte
+		binary.BigEndian.PutUint32(seed[:], epoch)
+		if f.debug {
+			f.log("[debug] det query ch=%d blk=%d epoch=%d", channel, block, epoch)
+		}
+		return protocol.EncodeQueryDeterministic(f.queryKey, channel, block, f.domain, f.queryMode, seed[:])
+	}
+	if f.debug {
+		f.log("[debug] rnd query ch=%d blk=%d share=%v eligible=%v epoch=%d", channel, block, share, eligible, epoch)
+	}
+	return protocol.EncodeQuery(f.queryKey, channel, block, f.domain, f.queryMode)
 }
 
 // SetActiveResolvers updates the healthy resolver pool. Called by ResolverChecker.
@@ -604,7 +649,7 @@ func (f *Fetcher) FetchBlock(ctx context.Context, channel, block uint16) ([]byte
 			return nil, err
 		}
 
-		qname, err := protocol.EncodeQuery(f.queryKey, channel, block, f.domain, f.queryMode)
+		qname, err := f.encodeBlockQuery(channel, block)
 		if err != nil {
 			return nil, fmt.Errorf("encode query: %w", err)
 		}
@@ -637,23 +682,160 @@ func (f *Fetcher) FetchBlock(ctx context.Context, channel, block uint16) ([]byte
 	return nil, lastErr
 }
 
-// FetchMetadata fetches and parses the metadata block (channel 0).
+// Extended-metadata tuning. Constants here, not fields, because they don't
+// vary per fetcher and tests can patch by replacing the literal call site.
+const (
+	metadataExtMaxRetries  = 10               // hash mismatches before falling back to legacy fetch
+	metadataExtCooldownDur = 10 * time.Minute // after the round gives up, skip the extended fast path
+	metadataLegacyCap      = 64               // legacy fetch max blocks; bumped from 10
+
+	// metadataBlockPreallocHint is a *client-side* guess at average per-block
+	// payload size, used only to pre-size the assembled-V0 buffer so we don't
+	// realloc on every Append. Decoupled from the server's MinBlockPayload —
+	// we don't want to couple the client to a server-side knob that may
+	// move to env config later.
+	metadataBlockPreallocHint = 256
+)
+
+// FetchMetadata returns the current metadata. Block 0 of channel 0 may
+// carry an extended header (magic + block_count + hash) packed into the
+// otherwise-unused Marker + Timestamp fields. New servers emit that;
+// old servers don't. We always fetch block 0 first; if it has the magic
+// we use the fast parallel path, otherwise we fall back to the legacy
+// "fetch-until-parse-succeeds" loop. The cooldown only kicks in when the
+// fast path is repeatedly broken (e.g., snapshot churn that hash-verify
+// can't ride out), in which case we go straight to legacy for a while.
 func (f *Fetcher) FetchMetadata(ctx context.Context) (*protocol.Metadata, error) {
-	data, err := f.FetchBlock(ctx, protocol.MetadataChannel, 0)
+	block0, err := f.FetchBlock(ctx, protocol.MetadataChannel, 0)
 	if err != nil {
 		return nil, fmt.Errorf("fetch metadata block 0: %w", err)
 	}
 
-	meta, err := protocol.ParseMetadata(data)
-	if err == nil {
+	extended, count, hash, hdrErr := protocol.PeekExtendedHeader(block0)
+	if extended && !f.extInCooldown() {
+		meta, err := f.fetchMetadataExtended(ctx, block0, count, hash)
+		if err == nil {
+			f.extFailCount.Store(0)
+			f.cacheEpoch.Store(meta.NextFetch)
+			return meta, nil
+		}
+		if n := f.extFailCount.Add(1); n >= metadataExtMaxRetries {
+			f.extCooldownUntil.Store(time.Now().Add(metadataExtCooldownDur).Unix())
+			f.extFailCount.Store(0)
+			if f.debug {
+				f.log("[debug] extended metadata: %d consecutive failures, cooling down for %v", n, metadataExtCooldownDur)
+			}
+		}
+		if f.debug {
+			f.log("[debug] extended metadata failed (%v), falling back to legacy", err)
+		}
+		// Fall through to legacy path below — we already have block 0.
+	}
+	if hdrErr != nil && f.debug {
+		f.log("[debug] extended header peek: %v (using legacy fetch)", hdrErr)
+	}
+	return f.fetchMetadataLegacy(ctx, block0)
+}
+
+// fetchMetadataExtended handles the fast path: block 0 already in hand
+// with a valid extended header. Fetches blocks 1..N-1 in parallel,
+// concatenates, verifies hash, parses. Retries up to metadataExtMaxRetries
+// times on hash mismatch (snapshot drift between block 0 and the others).
+func (f *Fetcher) fetchMetadataExtended(parent context.Context, block0 []byte, count uint8, hash [protocol.EMHHashLen]byte) (*protocol.Metadata, error) {
+	var lastErr error
+	for attempt := 0; attempt < metadataExtMaxRetries; attempt++ {
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		// Re-fetch block 0 on retry — the server may have refreshed and
+		// the previous block 0's hash no longer matches its peers.
+		current := block0
+		currentCount := count
+		currentHash := hash
+		if attempt > 0 {
+			b0, err := f.FetchBlock(parent, protocol.MetadataChannel, 0)
+			if err != nil {
+				return nil, fmt.Errorf("retry block 0: %w", err)
+			}
+			ext, c, h, herr := protocol.PeekExtendedHeader(b0)
+			if !ext || herr != nil {
+				return nil, fmt.Errorf("retry block 0 lost extended header: %v", herr)
+			}
+			current, currentCount, currentHash = b0, c, h
+		}
+
+		blocks := make([][]byte, currentCount)
+		blocks[0] = current
+		if currentCount > 1 {
+			ctx, cancel := context.WithCancel(parent)
+			var (
+				wg     sync.WaitGroup
+				errMu  sync.Mutex
+				blkErr error
+			)
+			for i := uint16(1); i < uint16(currentCount); i++ {
+				wg.Add(1)
+				go func(idx uint16) {
+					defer wg.Done()
+					b, err := f.FetchBlock(ctx, protocol.MetadataChannel, idx)
+					if err != nil {
+						errMu.Lock()
+						firstFail := blkErr == nil
+						if firstFail {
+							blkErr = fmt.Errorf("block %d: %w", idx, err)
+						}
+						errMu.Unlock()
+						if firstFail {
+							cancel()
+						}
+						return
+					}
+					blocks[idx] = b
+				}(i)
+			}
+			wg.Wait()
+			cancel()
+			if blkErr != nil {
+				return nil, blkErr
+			}
+		}
+
+		assembled := make([]byte, 0, int(currentCount)*metadataBlockPreallocHint)
+		for _, b := range blocks {
+			assembled = append(assembled, b...)
+		}
+		if len(assembled) < protocol.EMHHeaderLen {
+			return nil, fmt.Errorf("assembled payload too short: %d", len(assembled))
+		}
+		if err := protocol.VerifyExtendedHash(currentHash, assembled[protocol.EMHHeaderLen:]); err != nil {
+			lastErr = err
+			if f.debug {
+				f.log("[debug] extended hash mismatch attempt %d/%d: %v", attempt+1, metadataExtMaxRetries, err)
+			}
+			continue
+		}
+		meta, err := protocol.ParseMetadata(assembled)
+		if err != nil {
+			return nil, fmt.Errorf("parse: %w", err)
+		}
 		return meta, nil
 	}
+	return nil, fmt.Errorf("extended metadata: %d consecutive hash mismatches: %w", metadataExtMaxRetries, lastErr)
+}
 
-	// Metadata may span multiple blocks.
-	allData := make([]byte, len(data))
-	copy(allData, data)
-
-	for blk := uint16(1); blk < 10; blk++ {
+// fetchMetadataLegacy is the legacy multi-block-probe path against channel
+// 0. Used when the server doesn't emit the extended header, or when the
+// extended fast path has been failing and we're in cooldown. Slated for
+// removal in 1.0.0 once every supported server emits the extended header.
+func (f *Fetcher) fetchMetadataLegacy(ctx context.Context, block0 []byte) (*protocol.Metadata, error) {
+	meta, err := protocol.ParseMetadata(block0)
+	if err == nil {
+		f.cacheEpoch.Store(meta.NextFetch)
+		return meta, nil
+	}
+	allData := make([]byte, len(block0))
+	copy(allData, block0)
+	for blk := uint16(1); blk < metadataLegacyCap; blk++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -664,11 +846,18 @@ func (f *Fetcher) FetchMetadata(ctx context.Context) (*protocol.Metadata, error)
 		allData = append(allData, block...)
 		meta, parseErr := protocol.ParseMetadata(allData)
 		if parseErr == nil {
+			f.cacheEpoch.Store(meta.NextFetch)
 			return meta, nil
 		}
 	}
-
 	return nil, fmt.Errorf("could not parse metadata: %w", err)
+}
+
+// extInCooldown returns true while we should skip the extended fast path
+// after a recent run of failures. State is in-RAM only; restart clears it.
+func (f *Fetcher) extInCooldown() bool {
+	until := f.extCooldownUntil.Load()
+	return until > 0 && time.Now().Unix() < until
 }
 
 // FetchLatestVersion fetches the latest release version from the dedicated

@@ -124,6 +124,59 @@ type ProfileList struct {
 	// ProfilePicsEnabled enables fetching avatars over DNS when the
 	// GitHub relay can't serve them. Off by default.
 	ProfilePicsEnabled bool `json:"profilePicsEnabled,omitempty"`
+
+	// Connection settings (formerly per-profile). 0 = use default.
+	QueryMode string  `json:"queryMode,omitempty"` // "single" or "double"
+	RateLimit float64 `json:"rateLimit,omitempty"` // parallel block fetches
+	Scatter   int     `json:"scatter,omitempty"`   // resolvers per block
+	Timeout   float64 `json:"timeout,omitempty"`   // DNS query timeout (s)
+
+	// ResolverCacheShare makes content queries deterministic so multiple
+	// users of the same server can share public DNS resolver caches.
+	// Default off until field-tested.
+	ResolverCacheShare bool `json:"resolverCacheShare,omitempty"`
+}
+
+// ShareEnabled returns whether the shared-resolver-cache feature is on.
+func (pl *ProfileList) ShareEnabled() bool {
+	if pl == nil {
+		return false
+	}
+	return pl.ResolverCacheShare
+}
+
+// Defaults for the connection settings exposed on the settings page.
+const (
+	defaultQueryMode = "single"
+	defaultRateLimit = 10.0
+	defaultScatter   = 6
+	defaultTimeout   = 10.0
+)
+
+// connectionSettings returns the effective values from pl, substituting
+// defaults for any zero field. Centralises the fallback so every place
+// that builds a fetcher reads the same numbers.
+func connectionSettings(pl *ProfileList) (queryMode string, rateLimit float64, scatter int, timeout float64) {
+	queryMode = defaultQueryMode
+	rateLimit = defaultRateLimit
+	scatter = defaultScatter
+	timeout = defaultTimeout
+	if pl == nil {
+		return
+	}
+	if pl.QueryMode != "" {
+		queryMode = pl.QueryMode
+	}
+	if pl.RateLimit > 0 {
+		rateLimit = pl.RateLimit
+	}
+	if pl.Scatter > 0 {
+		scatter = pl.Scatter
+	}
+	if pl.Timeout > 0 {
+		timeout = pl.Timeout
+	}
+	return
 }
 
 // lastScanData is the on-disk structure for last_scan.json.
@@ -910,23 +963,24 @@ func (s *Server) initFetcher() error {
 		fetcher.ImportStats(m)
 	}
 
-	if cfg.QueryMode == "double" {
+	// Connection settings are global (live on ProfileList). Defaults
+	// apply when fields are zero/empty.
+	pl, _ := s.loadProfiles()
+	qm, rl, sc, to := connectionSettings(pl)
+	if qm == "double" {
 		fetcher.SetQueryMode(protocol.QueryMultiLabel)
 	}
 	fetcher.SetDebug(debug)
 	s.scanner.SetDebug(debug)
-	if cfg.RateLimit > 0 {
-		fetcher.SetRateLimit(cfg.RateLimit)
+	if rl > 0 {
+		fetcher.SetRateLimit(rl)
 	}
-	if cfg.Scatter > 1 {
-		fetcher.SetScatter(cfg.Scatter)
+	if sc > 1 {
+		fetcher.SetScatter(sc)
 	}
-
-	timeout := 15 * time.Second
-	if cfg.Timeout > 0 {
-		timeout = time.Duration(cfg.Timeout * float64(time.Second))
-	}
+	timeout := time.Duration(to * float64(time.Second))
 	fetcher.SetTimeout(timeout)
+	fetcher.SetCacheShare(pl.ShareEnabled())
 
 	fetcher.SetLogFunc(func(msg string) {
 		s.addLog(msg)
@@ -1105,7 +1159,8 @@ func (s *Server) checkLatestVersion(ctx context.Context) (string, error) {
 	// Match the regular fetcher: selected active list, then bank, then cfg.
 	resolvers := cfg.Resolvers
 	var debug bool
-	if pl, plErr := s.loadProfiles(); plErr == nil {
+	pl, _ := s.loadProfiles()
+	if pl != nil {
 		debug = pl.Debug
 		if list := findList(pl, pl.SelectedList); list != nil && len(list.Resolvers) > 0 {
 			resolvers = list.Resolvers
@@ -1118,21 +1173,19 @@ func (s *Server) checkLatestVersion(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create fetcher: %w", err)
 	}
-	if cfg.QueryMode == "double" {
+	qm, rl, sc, to := connectionSettings(pl)
+	if qm == "double" {
 		fetcher.SetQueryMode(protocol.QueryMultiLabel)
 	}
 	fetcher.SetDebug(debug)
 	s.scanner.SetDebug(debug)
-	if cfg.RateLimit > 0 {
-		fetcher.SetRateLimit(cfg.RateLimit)
+	if rl > 0 {
+		fetcher.SetRateLimit(rl)
 	}
-	if cfg.Scatter > 1 {
-		fetcher.SetScatter(cfg.Scatter)
+	if sc > 1 {
+		fetcher.SetScatter(sc)
 	}
-	timeout := 15 * time.Second
-	if cfg.Timeout > 0 {
-		timeout = time.Duration(cfg.Timeout * float64(time.Second))
-	}
+	timeout := time.Duration(to * float64(time.Second))
 	fetcher.SetTimeout(timeout)
 	fetcher.SetLogFunc(func(msg string) {
 		s.addLog(msg)
@@ -1952,6 +2005,18 @@ func (s *Server) handleResetResolverStats(w http.ResponseWriter, r *http.Request
 		return
 	}
 	fetcher.ResetStats()
+	// Persistence: clear pl.ResolverScores on disk too. Without this, the
+	// in-memory reset is lost on next restart — the fetcher reloads the
+	// pre-reset scores from profiles.json on initFetcher.
+	s.profilesMu.Lock()
+	pl, err := s.loadProfilesExisting()
+	if err == nil && pl != nil && len(pl.ResolverScores) > 0 {
+		pl.ResolverScores = nil
+		if err := s.saveProfiles(pl); err != nil {
+			s.addLog(fmt.Sprintf("reset stats: save profiles failed: %v", err))
+		}
+	}
+	s.profilesMu.Unlock()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -2829,6 +2894,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if pl == nil {
 			pl = &ProfileList{}
 		}
+		qm, rl, sc, to := connectionSettings(pl)
 		writeJSON(w, map[string]any{
 			"fontSize":           pl.FontSize,
 			"debug":              pl.Debug,
@@ -2837,6 +2903,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"scanPromptOff":      pl.ScanPromptOff,
 			"profilePicsEnabled": pl.ProfilePicsEnabled,
 			"skipUpdateVersion":  pl.SkipUpdateVersion,
+			"queryMode":          qm,
+			"rateLimit":          rl,
+			"scatter":            sc,
+			"timeout":            to,
+			"resolverCacheShare": pl.ShareEnabled(),
 			"version":            version.Version,
 			"commit":             version.Commit,
 		})
@@ -2844,13 +2915,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// Optional pointers so partial requests don't reset other fields.
 		var req struct {
-			FontSize           *int    `json:"fontSize"`
-			Debug              *bool   `json:"debug"`
-			Theme              *string `json:"theme"`
-			Lang               *string `json:"lang"`
-			ScanPromptOff      *bool   `json:"scanPromptOff"`
-			ProfilePicsEnabled *bool   `json:"profilePicsEnabled"`
-			SkipUpdateVersion  *string `json:"skipUpdateVersion"`
+			FontSize           *int     `json:"fontSize"`
+			Debug              *bool    `json:"debug"`
+			Theme              *string  `json:"theme"`
+			Lang               *string  `json:"lang"`
+			ScanPromptOff      *bool    `json:"scanPromptOff"`
+			ProfilePicsEnabled *bool    `json:"profilePicsEnabled"`
+			SkipUpdateVersion  *string  `json:"skipUpdateVersion"`
+			QueryMode          *string  `json:"queryMode"`
+			RateLimit          *float64 `json:"rateLimit"`
+			Scatter            *int     `json:"scatter"`
+			Timeout            *float64 `json:"timeout"`
+			ResolverCacheShare *bool    `json:"resolverCacheShare"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid JSON", 400)
@@ -2894,6 +2970,21 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.SkipUpdateVersion != nil {
 			pl.SkipUpdateVersion = *req.SkipUpdateVersion
 		}
+		if req.QueryMode != nil && (*req.QueryMode == "single" || *req.QueryMode == "double") {
+			pl.QueryMode = *req.QueryMode
+		}
+		if req.RateLimit != nil && *req.RateLimit >= 0 {
+			pl.RateLimit = *req.RateLimit
+		}
+		if req.Scatter != nil && *req.Scatter >= 0 {
+			pl.Scatter = *req.Scatter
+		}
+		if req.Timeout != nil && *req.Timeout >= 0 {
+			pl.Timeout = *req.Timeout
+		}
+		if req.ResolverCacheShare != nil {
+			pl.ResolverCacheShare = *req.ResolverCacheShare
+		}
 		if err := s.saveProfiles(pl); err != nil {
 			http.Error(w, fmt.Sprintf("save: %v", err), 500)
 			return
@@ -2907,6 +2998,16 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				f.SetDebug(*req.Debug)
 			}
 			s.scanner.SetDebug(*req.Debug)
+		}
+		// Same for shared-cache toggle — apply to the running fetcher so
+		// the user sees the change without having to restart anything.
+		if req.ResolverCacheShare != nil {
+			s.mu.RLock()
+			f := s.fetcher
+			s.mu.RUnlock()
+			if f != nil {
+				f.SetCacheShare(pl.ShareEnabled())
+			}
 		}
 		writeJSON(w, map[string]any{"ok": true})
 

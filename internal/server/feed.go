@@ -24,7 +24,7 @@ type Feed struct {
 	contentHashes    map[int]uint32
 	chatTypes        map[int]protocol.ChatType
 	canSend          map[int]bool
-	metaBlocks       [][]byte // metadata for all channels
+	metaBlocks       [][]byte // metadata for channel 0; includes extended header (see metadata_ext.go)
 	versionBlocks    [][]byte // channel for latest server-known release version
 	titlesBlocks     [][]byte // channel for per-channel display names
 	updated          time.Time
@@ -243,12 +243,16 @@ func (f *Feed) getMetadataBlock(block int) ([]byte, error) {
 	return blocks[block], nil
 }
 
-// rebuildMetaBlocks re-serializes the metadata and splits it into blocks.
-// Must be called with f.mu held.
+// rebuildMetaBlocks re-serializes the metadata and splits it into blocks
+// for channel 0. The Marker + Timestamp fields are repurposed to embed a
+// 7-byte header (magic + block_count + content_hash) so up-to-date clients
+// can fetch all blocks in parallel and verify snapshot coherence; old
+// clients still parse the same wire format and just ignore those fields.
+// See protocol/metadata_ext.go for the layout. Must be called with f.mu
+// held.
 func (f *Feed) rebuildMetaBlocks() {
 	meta := protocol.Metadata{
-		Marker:           f.marker,
-		Timestamp:        uint32(time.Now().Unix()),
+		// Marker + Timestamp are overwritten by EncodeMetadataExtended.
 		NextFetch:        f.nextFetch,
 		TelegramLoggedIn: f.telegramLoggedIn,
 	}
@@ -270,7 +274,18 @@ func (f *Feed) rebuildMetaBlocks() {
 		})
 	}
 
-	f.metaBlocks = protocol.SplitIntoBlocks(protocol.SerializeMetadata(&meta))
+	blocks, err := protocol.EncodeMetadataExtended(&meta)
+	if err != nil {
+		// Should never happen for sensible metadata; fall back to the
+		// plain V0 encoding so we still serve *something* and old clients
+		// see no change.
+		log.Printf("[meta] EncodeMetadataExtended failed: %v — serving plain V0", err)
+		meta.Marker = f.marker
+		meta.Timestamp = uint32(time.Now().Unix())
+		f.metaBlocks = protocol.SplitIntoBlocks(protocol.SerializeMetadata(&meta))
+		return
+	}
+	f.metaBlocks = blocks
 }
 
 func (f *Feed) getTitlesBlock(block int) ([]byte, error) {
