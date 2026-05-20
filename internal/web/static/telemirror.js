@@ -528,6 +528,17 @@
       var pid = 'tmp_' + i;
       if (plain) tmPostText[pid] = plain;
 
+      // IPFS Media Relay: Detect [IPFS] tag in text
+      var ipfs = null;
+      if (p.text) {
+        var m = p.text.match(/\[IPFS\]([^:]+):([^:]+):\[([^\]]+)\]/);
+        if (m) {
+          ipfs = { cid: m[1], color: m[2], type: m[3] };
+          // Remove the tag from visible text
+          p.text = p.text.replace(/\[IPFS\][^:]+:[^:]+:\[[^\]]+\]/, '').trim();
+        }
+      }
+
       html += '<div class="tm-post" data-pid="' + pid + '">';
 
       // Head: author + msg id + edited + copy button. Time at the bottom.
@@ -568,6 +579,10 @@
       }
 
       if (p.text) html += '<div class="tm-post-text">' + tmStripEmojiSprites(p.text) + '</div>';
+
+      if (ipfs) {
+        html += tmRenderIPFS(ipfs, i);
+      }
 
       if (p.media && p.media.length) {
         var photoCount = 0;
@@ -842,4 +857,74 @@
       if (e.key === 'Enter') { e.preventDefault(); window.telemirrorAdd(); }
     });
   });
+
+  // IPFS Progressive UI Loading
+  function tmRenderIPFS(ipfs, postIdx) {
+    var gateways = [
+      'https://ipfs.io/ipfs/',
+      'https://cloudflare-ipfs.com/ipfs/',
+      'https://dweb.link/ipfs/',
+      'https://gateway.pinata.cloud/ipfs/'
+    ];
+    var id = 'ipfs-' + postIdx + '-' + Math.random().toString(36).substr(2, 5);
+    
+    // Background async fetch with delay to let UI render
+    setTimeout(function() {
+      tmFetchIPFS(id, ipfs.cid, gateways, 0);
+    }, 100);
+
+    var style = 'background-color:' + tmEscAttr(ipfs.color) + ';aspect-ratio:16/9;width:100%;border-radius:8px;margin:8px 0;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;transition:background 0.5s;min-height:100px;';
+    
+    var content = '<div id="' + id + '" class="tm-ipfs-container" style="' + style + '">';
+    if (ipfs.type === 'VIDEO') {
+       content += '<span style="color:#fff;font-size:32px;opacity:0.3;">▶</span>';
+    }
+    content += '</div>';
+    return content;
+  }
+
+  function tmFetchIPFS(id, cid, gateways, index) {
+    if (index >= gateways.length) return;
+    var url = gateways[index] + cid;
+    var el = document.getElementById(id);
+    if (!el) return;
+
+    fetch(url)
+      .then(function(r) {
+        if (!r.ok) throw new Error();
+        return r.blob();
+      })
+      .then(function(blob) {
+        var objUrl = URL.createObjectURL(blob);
+        var type = blob.type || '';
+        var media;
+        if (type.startsWith('video/')) {
+           media = document.createElement('video');
+           media.src = objUrl;
+           media.controls = true;
+           media.style.width = '100%';
+           media.style.height = '100%';
+           media.style.display = 'block';
+           media.style.opacity = '0';
+           media.style.transition = 'opacity 0.5s';
+           media.onloadeddata = function() { media.style.opacity = '1'; el.style.background = 'transparent'; };
+        } else {
+           media = document.createElement('img');
+           media.src = objUrl;
+           media.style.width = '100%';
+           media.style.height = '100%';
+           media.style.objectFit = 'cover';
+           media.style.display = 'block';
+           media.style.opacity = '0';
+           media.style.transition = 'opacity 0.5s';
+           media.onload = function() { media.style.opacity = '1'; el.style.background = 'transparent'; };
+        }
+        el.innerHTML = '';
+        el.appendChild(media);
+      })
+      .catch(function() {
+        // Failover to next gateway
+        tmFetchIPFS(id, cid, gateways, index + 1);
+      });
+  }
 })();

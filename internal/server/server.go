@@ -34,6 +34,7 @@ type Config struct {
 	DNSMediaCompression string // DNS-relay compression: none|gzip|deflate
 	FetchInterval       time.Duration // 0 = default 10m; floor enforced by main
 	GitHubRelay         GitHubRelayConfig
+	IPFSRelay           IPFSRelayConfig
 	Telegram            TelegramConfig
 }
 
@@ -95,7 +96,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// Spin up the media cache when at least one relay is enabled. The cache
 	// owns the byte pipeline; whether DNS or GitHub serves bytes to clients
 	// is controlled by per-relay flags on each MediaMeta.
-	anyRelay := s.cfg.DNSMediaEnabled || s.cfg.GitHubRelay.Active()
+	anyRelay := s.cfg.DNSMediaEnabled || s.cfg.GitHubRelay.Active() || s.cfg.IPFSRelay.Active()
 	if anyRelay {
 		ttlMin := s.cfg.DNSMediaCacheTTL
 		if ttlMin <= 0 {
@@ -134,6 +135,14 @@ func (s *Server) Run(ctx context.Context) error {
 				}
 				log.Printf("[server] github relay: repo=%s branch=%s max=%d ttl=%dm",
 					gh.Repo(), branch, gh.MaxBytes(), s.cfg.GitHubRelay.TTLMinutes)
+			}
+		}
+
+		if s.cfg.IPFSRelay.Active() {
+			ipfs := NewIPFSRelay(s.cfg.IPFSRelay)
+			if ipfs != nil {
+				mediaCache.SetIPFSRelay(ipfs)
+				log.Printf("[server] ipfs relay: enabled max=%d", s.cfg.IPFSRelay.MaxBytes)
 			}
 		}
 	} else {

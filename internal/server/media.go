@@ -32,7 +32,8 @@ type MediaCache struct {
 
 	logf func(format string, args ...interface{})
 
-	gh *GitHubRelay
+	gh   *GitHubRelay
+	ipfs *IPFSRelay
 
 	mu          sync.RWMutex
 	byKey       map[string]*mediaEntry // upstream key (file_id / URL) → entry
@@ -62,6 +63,7 @@ type mediaEntry struct {
 	crc32     uint32
 	blocks    [][]byte
 	expiresAt time.Time
+	ipfsFlag  string // [IPFS]<cid>:<color>:[IMAGE/VIDEO]
 	// inflight prevents the eviction sweep from reaping an entry that is
 	// currently being downloaded by a goroutine that hasn't installed it yet.
 	inflight bool
@@ -268,6 +270,22 @@ func (c *MediaCache) StoreWithOptions(cacheKey, tag string, content []byte, mime
 				c.logf("media: gh-relay upload failed: %v", err)
 			}
 		}()
+	}
+
+	if c.ipfs != nil {
+		// IPFS processing and upload is also best-effort.
+		// Since it can change the body (compression), we do it and store the result
+		// in the entry if we want to cache it, but for now we just return it in meta.
+		// We'll run it synchronously because we need the CID and Color for the meta.
+		ipfs := c.ipfs
+		body := content
+		res, err := ipfs.ProcessAndUpload(context.Background(), body, mimeType)
+		if err != nil {
+			c.logf("media: ipfs-relay upload failed: %v", err)
+		} else {
+			// Format: [IPFS]<cid>:<dominant_color_hex>:[IMAGE/VIDEO]
+			entry.ipfsFlag = fmt.Sprintf("[IPFS]%s:%s:[%s]", res.CID, res.DominantColor, res.MediaType)
+		}
 	}
 
 	meta := c.metaForLocked(entry)
@@ -505,6 +523,7 @@ func (c *MediaCache) metaForLocked(entry *mediaEntry) protocol.MediaMeta {
 		meta.Channel = entry.channel
 		meta.Blocks = uint16(len(entry.blocks))
 	}
+	meta.IPFS = entry.ipfsFlag
 	return meta
 }
 
@@ -514,6 +533,13 @@ func (c *MediaCache) SetGitHubRelay(g *GitHubRelay) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gh = g
+}
+
+// SetIPFSRelay attaches the IPFS relay.
+func (c *MediaCache) SetIPFSRelay(i *IPFSRelay) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ipfs = i
 }
 
 // TouchRelayEntries refreshes relay lastSeen for every cached file so

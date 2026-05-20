@@ -33,6 +33,7 @@ type MediaMeta struct {
 	Blocks   uint16 // DNS block count (when Relays[RelayDNS])
 	CRC32    uint32
 	Filename string
+	IPFS     string // custom flag [IPFS]<cid>:<color>:[IMAGE/VIDEO]
 }
 
 // HasRelay reports whether the relay at idx is available. Out-of-range and
@@ -171,6 +172,12 @@ func splitFilenameExt(s string) (base, ext string) {
 // metadata line's trailing \n, so an empty caption simply has no extra body).
 func EncodeMediaText(meta MediaMeta, caption string) string {
 	header := meta.String()
+	if meta.IPFS != "" {
+		if caption == "" {
+			return header + meta.IPFS
+		}
+		return header + caption + "\n" + meta.IPFS
+	}
 	if caption == "" {
 		// Drop the trailing newline so the message text doesn't end with a
 		// blank line for caption-less media.

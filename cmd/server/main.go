@@ -49,6 +49,9 @@ func main() {
 	ghBranch := flag.String("github-relay-branch", "main", "Default branch to commit to (e.g. main, master)")
 	ghMaxSizeKB := flag.Int("github-relay-max-size", 15*1024, "Per-file cap for the GitHub relay in KB (0 = no cap)")
 	ghCacheTTLMin := flag.Int("github-relay-ttl", 600, "TTL for GitHub-relay objects in minutes")
+	ipfsEnabled := flag.Bool("ipfs-relay-enabled", false, "Serve media via IPFS (Pinata)")
+	ipfsJWT := flag.String("ipfs-relay-jwt", "", "Pinata JWT for IPFS pinning")
+	ipfsMaxSizeKB := flag.Int("ipfs-relay-max-size", 5*1024, "Per-file cap for the IPFS relay in KB (0 = no cap)")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "thefeed-server %s\n\nServes Telegram/X feed content over encrypted DNS for censorship-resistant access.\n\nUsage:\n  thefeed-server [flags]\n\nFlags:\n", version.Version)
@@ -215,6 +218,18 @@ func main() {
 		}
 	}
 
+	if !*ipfsEnabled && os.Getenv("THEFEED_IPFS_RELAY_ENABLED") == "1" {
+		*ipfsEnabled = true
+	}
+	if *ipfsJWT == "" {
+		*ipfsJWT = os.Getenv("THEFEED_IPFS_PINATA_JWT")
+	}
+	if env := os.Getenv("THEFEED_IPFS_RELAY_MAX_SIZE_KB"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil {
+			*ipfsMaxSizeKB = n
+		}
+	}
+
 	cfg := server.Config{
 		ListenAddr:       *listen,
 		Domain:           *domain,
@@ -240,6 +255,11 @@ func main() {
 			StatePath:  filepath.Join(*dataDir, "gh_relay_state.json"),
 			MaxBytes:   int64(*ghMaxSizeKB) * 1024,
 			TTLMinutes: *ghCacheTTLMin,
+		},
+		IPFSRelay: server.IPFSRelayConfig{
+			Enabled:  *ipfsEnabled,
+			JWT:      *ipfsJWT,
+			MaxBytes: int64(*ipfsMaxSizeKB) * 1024,
 		},
 		Telegram: server.TelegramConfig{
 			APIID:       id,
