@@ -124,9 +124,13 @@ build:
     - CLIENT_LDFLAGS="${SERVER_LDFLAGS} -X github.com/sartoopjj/thefeed/internal/version.AssetTemplate=${ASSET_TEMPLATE}"
     - go build -trimpath -ldflags="${SERVER_LDFLAGS}" -o "build/thefeed-server-${GOOS}-${GOARCH}${ext}" ./cmd/server
     - go build -trimpath -ldflags="${CLIENT_LDFLAGS}" -o "build/thefeed-client-${VERSION}-${GOOS}-${GOARCH}${ext}" ./cmd/client
-    # UPX only on linux/windows binaries.
+    # UPX on Linux only. Windows is excluded — UPX-packed PE binaries
+    # universally trigger AV heuristics (Defender Wacatac, Kaspersky
+    # Boogr.gsh, ClamAV) and users see the download flagged as malware.
+    # Plain Go binaries on Windows still trip "untrusted publisher"
+    # warnings but not malware detection.
     - |
-      if [ "$GOOS" = "linux" ] || [ "$GOOS" = "windows" ]; then
+      if [ "$GOOS" = "linux" ]; then
         find build -maxdepth 1 -type f -print0 \
           | xargs -0 -n1 -P "$(nproc)" -I{} sh -c 'upx --best --lzma "$1" || true' _ {}
       fi
@@ -228,9 +232,11 @@ build:android-arm:
 
 android-apk:
   stage: package
-  needs:
-    - "build:android-arm64"
-    - "build:android-arm"
+  # The APK no longer bundles a standalone client binary — the Go HTTP
+  # server is compiled into a gomobile-generated AAR loaded via JNI.
+  # build:android-arm{,64} still run for the Termux/CLI release assets
+  # but are not on the APK's critical path.
+  needs: ["test"]
   image: eclipse-temurin:17-jdk
   variables:
     GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
@@ -241,6 +247,12 @@ android-apk:
     ANDROID_BUILD_TOOLS: "35.0.0"
     ANDROID_SDK_ROOT: "$CI_PROJECT_DIR/.android-sdk"
     ANDROID_HOME: "$CI_PROJECT_DIR/.android-sdk"
+    # NDK r28b: 16 KB page alignment is the default linker setting,
+    # matching what build:android-arm{,64} use. gomobile bind picks
+    # this NDK up via ANDROID_NDK_HOME.
+    ANDROID_NDK_RELEASE: "r28b"
+    ANDROID_NDK_HOME: "$CI_PROJECT_DIR/.android-ndk"
+    GO_VERSION: "1.26.0"
   cache:
     - key: "gradle"
       paths:
@@ -250,8 +262,16 @@ android-apk:
     - key: "android-sdk-p${ANDROID_PLATFORM}-bt${ANDROID_BUILD_TOOLS}"
       paths: [.android-sdk/]
       policy: pull-push
+    - key: "android-ndk-${ANDROID_NDK_RELEASE}"
+      paths: [.android-ndk/]
+      policy: pull-push
+    - key:
+        files: [go.sum]
+        prefix: gomod-androidapk
+      paths: [.cache/go-mod]
+      policy: pull-push
   before_script:
-    - apt-get update -qq && apt-get install -y -qq curl unzip
+    - apt-get update -qq && apt-get install -y -qq curl unzip git
     # Install Android cmdline-tools + SDK platform + build-tools if missing.
     # sdkmanager is Java-based and this image already ships Temurin 17, so
     # no extra JDK install is needed.
@@ -271,11 +291,6 @@ android-apk:
       if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}" ] \
          || [ ! -d "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}" ]; then
         echo "Installing SDK platform-${ANDROID_PLATFORM} + build-tools ${ANDROID_BUILD_TOOLS} (cache miss)…"
-        # Pre-accept Google's SDK licenses by writing the well-known
-        # license-hash files directly. This avoids `yes | sdkmanager
-        # --licenses` which dies on SIGPIPE under set -o pipefail and was
-        # failing silently. Hashes are public — same values every Android
-        # Docker image uses.
         mkdir -p "$ANDROID_SDK_ROOT/licenses"
         printf '\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n' > "$ANDROID_SDK_ROOT/licenses/android-sdk-license"
         printf '\n84831b9409646a918e30573bab4c9c91346d8abd\n' > "$ANDROID_SDK_ROOT/licenses/android-sdk-preview-license"
@@ -283,13 +298,51 @@ android-apk:
       else
         echo "Reusing cached SDK platform-${ANDROID_PLATFORM} + build-tools ${ANDROID_BUILD_TOOLS}."
       fi
+    # NDK r28b for cgo: gomobile bind drives the NDK clang for the Go
+    # compilation step. Cached across runs.
+    - |
+      CLANG="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+      if [ ! -x "$CLANG" ]; then
+        echo "Downloading NDK ${ANDROID_NDK_RELEASE} (cache miss)…"
+        rm -rf "$ANDROID_NDK_HOME"
+        mkdir -p "$(dirname "$ANDROID_NDK_HOME")"
+        curl -sSL -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_RELEASE}-linux.zip"
+        unzip -q /tmp/ndk.zip -d "$(dirname "$ANDROID_NDK_HOME")"
+        mv "$(dirname "$ANDROID_NDK_HOME")/android-ndk-${ANDROID_NDK_RELEASE}" "$ANDROID_NDK_HOME"
+        rm /tmp/ndk.zip
+      else
+        echo "Reusing cached NDK ${ANDROID_NDK_RELEASE}."
+      fi
+    # Install a pinned Go toolchain — eclipse-temurin doesn't ship Go.
+    - |
+      if [ ! -x /usr/local/go/bin/go ]; then
+        echo "Installing Go ${GO_VERSION}…"
+        curl -sSL -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm /tmp/go.tar.gz
+      fi
+    - export PATH="/usr/local/go/bin:$CI_PROJECT_DIR/.gobin:$PATH"
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+    - export GOMODCACHE="$CI_PROJECT_DIR/.cache/go-mod"
+    - export GOBIN="$CI_PROJECT_DIR/.gobin"
+    - mkdir -p "$GOBIN" "$GOPATH"
+    - go install golang.org/x/mobile/cmd/gomobile@latest
+    - go install golang.org/x/mobile/cmd/gobind@latest
+    - gomobile init
   script:
-    - mkdir -p android/app/src/main/jniLibs/arm64-v8a
-    - mkdir -p android/app/src/main/jniLibs/armeabi-v7a
-    - test -f build/thefeed-client-android-arm64
-    - test -f build/thefeed-client-android-arm
-    - cp build/thefeed-client-android-arm64 android/app/src/main/jniLibs/arm64-v8a/libthefeed.so
-    - cp build/thefeed-client-android-arm   android/app/src/main/jniLibs/armeabi-v7a/libthefeed.so
+    # Build the gomobile AAR (in-process Go HTTP server, JNI-loaded).
+    # Both ABIs are produced in one bind invocation; the -extldflags is
+    # belt-and-suspenders against future NDK downgrades.
+    - VERSION="${CI_COMMIT_TAG:-dev}"
+    - COMMIT=$(git rev-parse --short HEAD)
+    - DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # -s -w drops the symbol table + DWARF (saves ~12 MB per ABI).
+    # 16 KB page alignment is required on Android 15+ devices
+    # configured for 16 KB pages — NDK r28+ defaults to this anyway,
+    # but the explicit flag is belt-and-suspenders.
+    - LDFLAGS="-s -w -X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE} -extldflags=-Wl,-z,max-page-size=16384"
+    - mkdir -p android/app/libs
+    - gomobile bind -target=android/arm,android/arm64,android/386,android/amd64 -androidapi 24 -ldflags="${LDFLAGS}" -o android/app/libs/mobile.aar ./mobile
     # Decode signing keystore. KEYSTORE_BASE64 can be a regular variable
     # (base64-encoded) or a File-type variable containing the raw bytes.
     # Required for any tag pipeline — we never ship debug-signed APKs
@@ -324,16 +377,25 @@ android-apk:
     # release build with the real signing key.
     - BT=release
     - TASK=assembleRelease
+    # Pass 1 — per-ABI split APKs (arm, arm64, x86, x86_64).
     - ./gradlew --no-daemon --build-cache $TASK
     - APK_DIR=app/build/outputs/apk/$BT
     - mkdir -p ../artifacts
     - cp "$APK_DIR"/app-arm64-v8a-${BT}.apk   "../artifacts/thefeed-android-${VERSION}-arm64-v8a.apk"
     - cp "$APK_DIR"/app-armeabi-v7a-${BT}.apk "../artifacts/thefeed-android-${VERSION}-armeabi-v7a.apk"
+    - cp "$APK_DIR"/app-x86-${BT}.apk         "../artifacts/thefeed-android-${VERSION}-x86.apk"
+    - cp "$APK_DIR"/app-x86_64-${BT}.apk      "../artifacts/thefeed-android-${VERSION}-x86_64.apk"
+    # Pass 2 — universal APK (arm + arm64 + x86_64, x86 stripped).
+    - ./gradlew --no-daemon --build-cache -PuniversalBuild=true $TASK
+    - cp "$APK_DIR"/app-${BT}.apk             "../artifacts/thefeed-android-${VERSION}-universal.apk"
   artifacts:
     name: "thefeed-android-apk"
     paths:
       - artifacts/thefeed-android-*-arm64-v8a.apk
       - artifacts/thefeed-android-*-armeabi-v7a.apk
+      - artifacts/thefeed-android-*-x86.apk
+      - artifacts/thefeed-android-*-x86_64.apk
+      - artifacts/thefeed-android-*-universal.apk
     expire_in: 1 week
 
 # ---------- GitLab Pages ----------
@@ -512,8 +574,11 @@ release:
       | FreeBSD | amd64 | [server-سرور](${DL_BASE}/thefeed-server-freebsd-amd64) / [client-کلاینت](${DL_BASE}/thefeed-client-${VERSION}-freebsd-amd64) |
       | FreeBSD | arm64 | [server-سرور](${DL_BASE}/thefeed-server-freebsd-arm64) / [client-کلاینت](${DL_BASE}/thefeed-client-${VERSION}-freebsd-arm64) |
       | Windows | amd64 | [server-سرور](${DL_BASE}/thefeed-server-windows-amd64.exe) / [client-کلاینت](${DL_BASE}/thefeed-client-${VERSION}-windows-amd64.exe) |
-      | Android | arm64-v8a (most modern phones) | [thefeed-android-${VERSION}-arm64-v8a.apk - اندروید (گوشی‌های جدید)](${DL_BASE}/thefeed-android-${VERSION}-arm64-v8a.apk) |
+      | Android | universal (arm + arm64 + x86_64, **recommended**) | [thefeed-android-${VERSION}-universal.apk - اندروید (یونیورسال، توصیه‌شده)](${DL_BASE}/thefeed-android-${VERSION}-universal.apk) |
+      | Android | arm64-v8a (modern phones, smaller) | [thefeed-android-${VERSION}-arm64-v8a.apk - اندروید (گوشی‌های جدید)](${DL_BASE}/thefeed-android-${VERSION}-arm64-v8a.apk) |
       | Android | armeabi-v7a (older 32-bit phones) | [thefeed-android-${VERSION}-armeabi-v7a.apk - اندروید (دستگاه‌های قدیمی‌تر)](${DL_BASE}/thefeed-android-${VERSION}-armeabi-v7a.apk) |
+      | Android | x86_64 (Chromebooks, emulators, WSA) | [thefeed-android-${VERSION}-x86_64.apk - اندروید (کروم‌بوک، شبیه‌ساز، WSA)](${DL_BASE}/thefeed-android-${VERSION}-x86_64.apk) |
+      | Android | x86 (32-bit Intel, niche) | [thefeed-android-${VERSION}-x86.apk - اندروید (اینتل ۳۲ بیت، نادر)](${DL_BASE}/thefeed-android-${VERSION}-x86.apk) |
       | iOS (unsigned) | universal | [thefeed-ios-${VERSION}-unsigned.ipa](${DL_BASE}/thefeed-ios-${VERSION}-unsigned.ipa) |
 
       **iOS / iPadOS (preview, iOS 14+):** the \`.ipa\` is unsigned. Re-sign it with your own Apple ID and provisioning profile (AltStore, Sideloadly, or \`xcrun altool\` upload to your own TestFlight). It will not install directly from a download.

@@ -395,6 +395,7 @@ func (s *Server) serve(ln net.Listener) error {
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/version-check", s.handleVersionCheck)
 	mux.HandleFunc("/api/update/github", s.handleGitHubUpdateCheck)
+	mux.HandleFunc("/api/update/download", s.handleUpdateDownload)
 	mux.HandleFunc("/api/cache/clear", s.handleClearCache)
 	mux.HandleFunc("/api/bg-image", s.handleBgImage)
 	mux.HandleFunc("/api/resolvers/apply-saved", s.handleApplySavedResolvers)
@@ -3088,10 +3089,10 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "latestVersion": v})
 }
 
-// handleGitHubUpdateCheck queries the public thefeed-files repo for the
-// latest published client version and returns a download URL tailored
-// to this binary's platform. Independent of the DNS-protocol version
-// check above — works without a configured profile.
+// handleGitHubUpdateCheck reads the latest GitHub Release tag for
+// sartoopjj/thefeed and returns a download URL tailored to this
+// binary's platform. Independent of the DNS-protocol version check
+// above — works without a configured profile.
 func (s *Server) handleGitHubUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -3105,6 +3106,48 @@ func (s *Server) handleGitHubUpdateCheck(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, st)
+}
+
+// handleUpdateDownload proxies a release asset through the server so
+// the UI can paint a progress bar (and Android can route the bytes
+// through the native bridge to MediaStore Downloads). The frontend
+// hits this with ?version=v0.19.1[&asset=...]; the server streams
+// the body back with Content-Disposition: attachment.
+func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	q := r.URL.Query()
+	v := strings.TrimSpace(q.Get("version"))
+	if v == "" {
+		http.Error(w, "version query parameter required", 400)
+		return
+	}
+	asset := strings.TrimSpace(q.Get("asset"))
+	if asset == "" {
+		asset = update.AssetFilename(v)
+	}
+	if asset == "" {
+		http.Error(w, "no asset known for this platform; pass &asset=... explicitly", 400)
+		return
+	}
+
+	// 10-minute budget covers the largest shipped artifact (signed
+	// Android APK, ~20 MB) on slow links.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	s.addLog(fmt.Sprintf("update: download requested version=%s asset=%s", v, asset))
+	err := update.StreamAsset(ctx, v, asset, w, s.addLog)
+	if err != nil {
+		// If body bytes already flew, http.Error writes after the
+		// fact and the browser sees a truncated download — the real
+		// error is in /api/logs. Pre-write errors return a clean 502.
+		s.addLog(fmt.Sprintf("update: download failed: %v", err))
+		http.Error(w, fmt.Sprintf("download failed: %v", err), 502)
+		return
+	}
 }
 
 // =====================================================================

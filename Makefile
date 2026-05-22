@@ -1,5 +1,6 @@
 .PHONY: all build build-server build-client test clean lint fmt vet \
-	ios-bind ios-bind-catalyst ios-build ios-test ios-clean ios-list-sims ios-deps
+	ios-bind ios-bind-catalyst ios-build ios-test ios-clean ios-list-sims ios-deps \
+	push push-tags release setup-remotes
 
 BINARY_SERVER = thefeed-server
 BINARY_CLIENT = thefeed-client
@@ -148,6 +149,94 @@ $(IOS_FRAMEWORK):
 
 ios-clean:
 	rm -rf $(IOS_FRAMEWORK) $(IOS_DIR)/build $(IOS_DIR)/DerivedData
+
+# ===== Android (gomobile in-process) =====
+# Requires: gomobile + Android SDK/NDK. The APK loads the Go HTTP server
+# via JNI System.loadLibrary instead of exec'ing a bundled binary —
+# avoids W^X / SELinux / 16 KB-page / AV pitfalls of the subprocess
+# approach. ANDROID_HOME and ANDROID_NDK_HOME must be set.
+
+ANDROID_AAR_DIR = android/app/libs
+ANDROID_AAR = $(ANDROID_AAR_DIR)/mobile.aar
+# -s -w strips the symbol table + DWARF debug info from the embedded
+# libgojni.so. With the same imports the old subprocess client binary
+# was ~8 MB; without these flags gomobile's .so was running >20 MB.
+# -extldflags forces 16 KB page alignment so the .so loads on Android
+# 15+ devices configured with 16 KB pages (NDK r28+ defaults to this).
+ANDROID_LDFLAGS = -s -w \
+                  -X github.com/sartoopjj/thefeed/internal/version.Version=$(VERSION) \
+                  -X github.com/sartoopjj/thefeed/internal/version.Commit=$(COMMIT) \
+                  -X github.com/sartoopjj/thefeed/internal/version.Date=$(DATE) \
+                  -extldflags=-Wl,-z,max-page-size=16384
+
+android-bind: ios-deps
+	@command -v gomobile >/dev/null 2>&1 || { echo "gomobile not found. Run: go install golang.org/x/mobile/cmd/gomobile@latest && gomobile init"; exit 1; }
+	@mkdir -p $(ANDROID_AAR_DIR)
+	gomobile bind -target=android/arm,android/arm64,android/386,android/amd64 -androidapi 24 -ldflags='$(ANDROID_LDFLAGS)' -o $(ANDROID_AAR) ./mobile
+
+# Two gradle passes: first produces 4 per-ABI APKs (arm, arm64, x86,
+# x86_64); second produces a universal APK containing 3 ABIs (no x86).
+android-apk: android-bind
+	@cd android && if [ ! -x ./gradlew ]; then gradle wrapper --gradle-version 8.10.2; fi && ./gradlew --no-daemon assembleRelease
+	@cd android && ./gradlew --no-daemon -PuniversalBuild=true assembleRelease
+
+android-clean:
+	rm -f $(ANDROID_AAR)
+	rm -rf android/app/build android/build android/.gradle
+
+# ===== Git multi-remote =====
+# We maintain two mirrors: origin (GitLab) and gh-origin (GitHub).
+# The targets below push to both so the two repos never drift.
+# Override with REMOTES=... to push to only a subset.
+REMOTES ?= origin gh-origin
+BRANCH  ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+
+# Configure both mirrors on a fresh clone (one-time). Idempotent — calling
+# it again just updates the URLs. Adjust the URLs here if a repo moves.
+GITLAB_URL ?= https://gitlab.com/sartoopjj/thefeed.git
+GITHUB_URL ?= https://github.com/sartoopjj/thefeed.git
+setup-remotes:
+	@if git remote | grep -q '^origin$$'; then \
+		git remote set-url origin $(GITLAB_URL); \
+	else \
+		git remote add origin $(GITLAB_URL); \
+	fi
+	@if git remote | grep -q '^gh-origin$$'; then \
+		git remote set-url gh-origin $(GITHUB_URL); \
+	else \
+		git remote add gh-origin $(GITHUB_URL); \
+	fi
+	@echo "Remotes configured:"
+	@git remote -v
+
+# Push the current branch to every remote in REMOTES. Stops at the first
+# failure so you notice instead of silently desyncing the mirrors.
+push:
+	@for r in $(REMOTES); do \
+		echo "→ $$r $(BRANCH)"; \
+		git push $$r $(BRANCH) || exit $$?; \
+	done
+
+# Push all annotated tags to every remote in REMOTES.
+push-tags:
+	@for r in $(REMOTES); do \
+		echo "→ $$r --tags"; \
+		git push $$r --tags || exit $$?; \
+	done
+
+# Tag the current HEAD and push it everywhere. Use:
+#   make release V=v0.19.0 [M="release notes"]
+# The push runs after the tag so a tag-name typo aborts before any
+# remote sees it. CI is wired to the v* tag pattern on GitHub.
+release:
+	@test -n "$(V)" || { echo "set V=vX.Y.Z (e.g. make release V=v0.19.0)" >&2; exit 1; }
+	@case "$(V)" in v*) ;; *) echo "V must start with 'v' (got $(V))" >&2; exit 1 ;; esac
+	@if git rev-parse "$(V)" >/dev/null 2>&1; then \
+		echo "Tag $(V) already exists locally — delete it first or pick a new version" >&2; exit 1; \
+	fi
+	git tag -a $(V) -m "$(if $(M),$(M),Release $(V))"
+	$(MAKE) push
+	$(MAKE) push-tags
 
 # UPX compression (requires upx in PATH) — only for Linux/Windows binaries
 upx:

@@ -1,12 +1,13 @@
 // Package mobile is the gomobile-bind entry point used by the iOS
-// (and Mac Catalyst) Swift app. It wraps internal/web.Server so the
-// HTTP server runs in-process — iOS does not allow bundled child
-// executables, so the Android subprocess approach can't be reused.
+// Swift app and the Android app. It wraps internal/web.Server so the
+// HTTP server runs in-process via a JNI .so — no subprocess, no exec
+// from nativeLibraryDir, no PIE/page-size/SELinux pitfalls.
 package mobile
 
 import (
 	"errors"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 
@@ -65,6 +66,25 @@ func NewServer(dataDir string, preferredPort int) (*Server, error) {
 		close(s.done)
 	}()
 	return s, nil
+}
+
+// NewAndroidServer is like NewServer but signals to internal/update
+// that the runtime is a per-ABI Android APK so the in-app update
+// prompt points at the matching APK asset (e.g.
+// thefeed-android-{V}-arm64-v8a.apk).
+func NewAndroidServer(dataDir string, preferredPort int) (*Server, error) {
+	os.Setenv("THEFEED_ANDROID_APK", "1")
+	return NewServer(dataDir, preferredPort)
+}
+
+// NewAndroidUniversalServer is like NewAndroidServer but for the
+// universal APK build — the in-app update prompt keeps the user on
+// the universal asset (thefeed-android-{V}-universal.apk) instead of
+// downgrading them to a per-ABI split on next update.
+func NewAndroidUniversalServer(dataDir string, preferredPort int) (*Server, error) {
+	os.Setenv("THEFEED_ANDROID_APK", "1")
+	os.Setenv("THEFEED_ANDROID_UNIVERSAL", "1")
+	return NewServer(dataDir, preferredPort)
 }
 
 // Port returns the listening port (0 after Stop).

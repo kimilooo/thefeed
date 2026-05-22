@@ -67,7 +67,7 @@ jobs:
           restore-keys: gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-
 
       - name: Install UPX
-        if: matrix.goos == 'linux' || matrix.goos == 'windows'
+        if: matrix.goos == 'linux'
         run: sudo apt-get install -y upx-ucl
 
       - name: Build Server
@@ -98,10 +98,10 @@ jobs:
           ext=""
           BUILD_MODE=""
           if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
-          # AssetTemplate matches the published filename in the
-          # thefeed-files repo so the in-app update prompt links straight
+          # AssetTemplate matches the published filename in this repo's
+          # GitHub Releases so the in-app update prompt links straight
           # to the right binary. {V} is replaced at runtime with the
-          # version string read from the public VERSION file.
+          # version tag parsed from /releases/latest.
           if [ "${{ matrix.goos }}" = "android" ]; then
             ASSET_TEMPLATE="thefeed-client-android-${{ matrix.goarch }}"
           else
@@ -114,6 +114,13 @@ jobs:
           # Force PIE for the binaries that ship inside the APK.
           if [ "${{ matrix.goos }}" = "android" ]; then
             BUILD_MODE="-buildmode=pie"
+            # Android 15+ ships devices configured for 16 KB memory pages.
+            # NDK r28+ defaults to 16 KB alignment but GitHub runners still
+            # default to r27 (4 KB). Force 16 KB alignment so the binary
+            # is mmap-able on 16 KB-page devices; on 4 KB devices the
+            # extra padding is harmless. GitLab CI pins NDK r28b and
+            # passes the same flag for consistency.
+            LDFLAGS="${LDFLAGS} -extldflags=-Wl,-z,max-page-size=16384"
           fi
           # Android: build with cgo so DNS resolution goes through bionic
           # libc / netd instead of Go's pure-Go resolver, which on Android
@@ -141,7 +148,15 @@ jobs:
           go build -trimpath -buildvcs=false $BUILD_MODE -ldflags="${LDFLAGS}" -o "$out" ./cmd/client
 
       - name: Compress with UPX
-        if: matrix.goos == 'linux' || matrix.goos == 'windows'
+        # Windows is excluded: UPX-packed PE binaries trigger generic
+        # AV heuristics (Defender's Wacatac/Trojan:Win32/Wacatac.B!ml,
+        # Kaspersky Boogr.gsh, multiple ClamAV signatures) almost
+        # universally. The compression saves ~10 MB per release artifact
+        # at the cost of false-positive flags on every Windows download.
+        # Ship plain Go binaries for Windows; users see the binary as
+        # untrusted-publisher but not as malware. Linux UPX still on —
+        # Linux AV engines are far less heuristic about packers.
+        if: matrix.goos == 'linux'
         run: |
           # Keep best/lzma for small binaries; xargs -P does them
           # in parallel across CPUs so wall time stays low.
@@ -155,25 +170,37 @@ jobs:
           path: build/
 
   android-apk:
-    needs: build
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          path: artifacts
-          merge-multiple: true
+          go-version: '1.26'
 
-      - name: Stage Android client binary as JNI library
+      - name: Install gomobile
         run: |
-          mkdir -p android/app/src/main/jniLibs/arm64-v8a
-          mkdir -p android/app/src/main/jniLibs/armeabi-v7a
-          test -f artifacts/thefeed-client-android-arm64
-          test -f artifacts/thefeed-client-android-arm
-          cp artifacts/thefeed-client-android-arm64 android/app/src/main/jniLibs/arm64-v8a/libthefeed.so
-          cp artifacts/thefeed-client-android-arm android/app/src/main/jniLibs/armeabi-v7a/libthefeed.so
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+
+      - name: Build gomobile AAR
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # -s -w drops the symbol table + DWARF (saves ~12 MB per
+          # ABI). 16 KB page alignment is required on Android 15+
+          # devices configured for 16 KB pages — NDK r28+ defaults to
+          # this; explicit flag works on older NDKs too.
+          LDFLAGS="-s -w -X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE} -extldflags=-Wl,-z,max-page-size=16384"
+          mkdir -p android/app/libs
+          gomobile bind -target=android/arm,android/arm64,android/386,android/amd64 -androidapi 24 \
+            -ldflags="${LDFLAGS}" -o android/app/libs/mobile.aar ./mobile
 
       - name: Decode signing keystore
         env:
@@ -195,6 +222,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Stage artifacts dir
+        run: mkdir -p artifacts
+
       - name: Build Android APK
         working-directory: android
         env:
@@ -206,13 +236,22 @@ jobs:
           if [ ! -x ./gradlew ]; then gradle wrapper --gradle-version 8.10.2; fi
           if [ -f app/keystore.jks ]; then BT=release; TASK=assembleRelease; else BT=debug; TASK=assembleDebug; fi
 
-          # No `clean` — fresh checkout is already clean and the
-          # Gradle build cache can reuse work between runs.
+          # Pass 1 — per-ABI split APKs (arm, arm64, x86, x86_64).
+          # No `clean` so the Gradle build cache can reuse work
+          # between runs.
           ./gradlew --no-daemon --build-cache $TASK
 
           APK_DIR=app/build/outputs/apk/$BT
           cp "$APK_DIR"/app-arm64-v8a-${BT}.apk    ../artifacts/thefeed-android-${VERSION}-arm64-v8a.apk
           cp "$APK_DIR"/app-armeabi-v7a-${BT}.apk  ../artifacts/thefeed-android-${VERSION}-armeabi-v7a.apk
+          cp "$APK_DIR"/app-x86-${BT}.apk          ../artifacts/thefeed-android-${VERSION}-x86.apk
+          cp "$APK_DIR"/app-x86_64-${BT}.apk       ../artifacts/thefeed-android-${VERSION}-x86_64.apk
+
+          # Pass 2 — universal APK (arm + arm64 + x86_64, x86 stripped).
+          # Different gradle property → different output layout, so the
+          # pass-1 split APKs above are safe.
+          ./gradlew --no-daemon --build-cache -PuniversalBuild=true $TASK
+          cp "$APK_DIR"/app-${BT}.apk              ../artifacts/thefeed-android-${VERSION}-universal.apk
 
       - name: Upload Android APK artifacts
         uses: actions/upload-artifact@v4
@@ -221,6 +260,9 @@ jobs:
           path: |
             artifacts/thefeed-android-*-arm64-v8a.apk
             artifacts/thefeed-android-*-armeabi-v7a.apk
+            artifacts/thefeed-android-*-x86.apk
+            artifacts/thefeed-android-*-x86_64.apk
+            artifacts/thefeed-android-*-universal.apk
 
   ios-ipa:
     needs: test
@@ -314,8 +356,11 @@ jobs:
             | FreeBSD | amd64 | [server-سرور](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-server-freebsd-amd64) / [client-کلاینت](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-client-${{ github.ref_name }}-freebsd-amd64) |
             | FreeBSD | arm64 | [server-سرور](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-server-freebsd-arm64) / [client-کلاینت](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-client-${{ github.ref_name }}-freebsd-arm64) |
             | Windows | amd64 | [server-سرور](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-server-windows-amd64.exe) / [client-کلاینت](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-client-${{ github.ref_name }}-windows-amd64.exe) |
-            | Android | arm64-v8a (most modern phones) | [thefeed-android-${{ github.ref_name }}-arm64-v8a.apk - اندروید (گوشی‌های جدید)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-arm64-v8a.apk) |
+            | Android | universal (arm + arm64 + x86_64, **recommended**) | [thefeed-android-${{ github.ref_name }}-universal.apk - اندروید (یونیورسال، توصیه‌شده)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-universal.apk) |
+            | Android | arm64-v8a (modern phones, smaller) | [thefeed-android-${{ github.ref_name }}-arm64-v8a.apk - اندروید (گوشی‌های جدید)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-arm64-v8a.apk) |
             | Android | armeabi-v7a (older 32-bit phones) | [thefeed-android-${{ github.ref_name }}-armeabi-v7a.apk - اندروید (دستگاه‌های قدیمی‌تر)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-armeabi-v7a.apk) |
+            | Android | x86_64 (Chromebooks, emulators, WSA) | [thefeed-android-${{ github.ref_name }}-x86_64.apk - اندروید (کروم‌بوک، شبیه‌ساز، WSA)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-x86_64.apk) |
+            | Android | x86 (32-bit Intel, niche) | [thefeed-android-${{ github.ref_name }}-x86.apk - اندروید (اینتل ۳۲ بیت، نادر)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-android-${{ github.ref_name }}-x86.apk) |
             | iOS (unsigned) | universal | [thefeed-ios-${{ github.ref_name }}-unsigned.ipa](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/thefeed-ios-${{ github.ref_name }}-unsigned.ipa) |
 
             **iOS / iPadOS (preview, iOS 14+):** the `.ipa` is unsigned. Re-sign it with your own Apple ID and provisioning profile (AltStore, Sideloadly, or `xcrun altool` upload to your own TestFlight). It will not install directly from a download.

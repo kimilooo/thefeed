@@ -680,6 +680,16 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
+# Resource limits — public-facing multi-user servers can have tens
+# of thousands of concurrent sockets (web clients + DNS upstream +
+# Telegram MTProto + outgoing media fetches). The default systemd
+# RLIMIT_NOFILE (usually 1024) trips well before that, surfacing as
+# "too many open files" errors and dropped connections. Raising the
+# limits here means operators don't have to run ulimit by hand.
+LimitNOFILE=524288
+LimitNPROC=infinity
+TasksMax=infinity
+
 # Security hardening
 ProtectHome=true
 PrivateTmp=true

@@ -3141,35 +3141,50 @@
   </div>
   <script>
     (function () {
-      // Server is the source of truth: wiping thefeeddata/ resets lang
-      // along with everything else. Sync XHR keeps this decision before
-      // first paint so the modal never flashes for returning users.
+      // Trust local stores first: they're set synchronously inside
+      // firstRunPickLang and survive the sync-XHR failure modes that
+      // appear when the client is hosted behind a reverse proxy.
+      // Browsers increasingly refuse sync XHR on the main thread, and
+      // when the proxy injects HTML (login pages, error pages) the
+      // JSON.parse below throws — both surfaced as "I picked a
+      // language but the modal kept coming back".
       var lang = '';
-      try {
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/api/settings', false);
-        xhr.send();
-        if (xhr.status === 200) lang = (JSON.parse(xhr.responseText).lang || '');
-      } catch (e) {
-        // Server unreachable — fall back to client-side caches.
-        try { if (typeof IOS !== 'undefined' && IOS.getLang) lang = IOS.getLang() || ''; } catch (e2) { }
-        try { if (!lang && typeof Android !== 'undefined' && Android.getLang) lang = Android.getLang() || ''; } catch (e2) { }
-        if (!lang) lang = localStorage.getItem('thefeed_lang') || '';
+      try { lang = localStorage.getItem('thefeed_lang') || ''; } catch (e) { }
+      try { if (!lang && typeof IOS !== 'undefined' && IOS.getLang) lang = IOS.getLang() || ''; } catch (e) { }
+      try { if (!lang && typeof Android !== 'undefined' && Android.getLang) lang = Android.getLang() || ''; } catch (e) { }
+      if (!lang) {
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', '/api/settings', false);
+          xhr.send();
+          if (xhr.status === 200) lang = (JSON.parse(xhr.responseText).lang || '');
+        } catch (e) { }
       }
       if (!lang) document.getElementById('firstRunLangModal').style.display = 'flex';
     })();
     function firstRunPickLang(l) {
-      // Persist server-side synchronously so the reload sees it.
-      try {
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/settings', false);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.send(JSON.stringify({ lang: l }));
-      } catch (e) { }
+      // Hide immediately so a slow POST doesn't leave the user staring
+      // at an apparently-frozen modal.
+      var modal = document.getElementById('firstRunLangModal');
+      if (modal) modal.style.display = 'none';
+      // Persist to every available store synchronously so the post-
+      // reload load handler sees the choice even if the POST fails or
+      // is still in flight.
       try { localStorage.setItem('thefeed_lang', l); } catch (e) { }
       try { if (typeof IOS !== 'undefined' && IOS.setLang) IOS.setLang(l); } catch (e) { }
       try { if (typeof Android !== 'undefined' && Android.setLang) Android.setLang(l); } catch (e) { }
-      location.reload();
+      // Fire-and-reload via async fetch with keepalive so the request
+      // survives navigation. No sync XHR — modern browsers throttle
+      // or refuse it on the main thread.
+      var done = function () { location.reload(); };
+      try {
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lang: l }),
+          keepalive: true,
+        }).then(done, done);
+      } catch (e) { done(); }
     }
   </script>
 
@@ -5055,10 +5070,10 @@
       } catch (e) { }
     }
 
-    // checkGitHubUpdate hits /api/update/github (which fetches the VERSION
-    // file from the public thefeed-files repo) and prompts the user with
-    // a download link tailored to their platform. `manual=true` shows a
-    // toast on "no update", `manual=false` stays silent.
+    // checkGitHubUpdate hits /api/update/github (which reads the latest
+    // GitHub Release tag for sartoopjj/thefeed) and prompts the user
+    // with a download link tailored to their platform.
+    // `manual=true` shows a toast on "no update", `manual=false` stays silent.
     async function checkGitHubUpdate(manual) {
       try {
         var r = await fetch('/api/update/github');
@@ -5123,15 +5138,117 @@
       document.getElementById('updateLater').onclick = dismiss;
       document.getElementById('updateSkip').onclick = function () { persistSkip(); dismiss(); };
       document.getElementById('updateDownload').onclick = function () {
-        try {
-          var a = document.createElement('a');
-          a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-          a.style.display = 'none';
-          document.body.appendChild(a); a.click(); a.remove();
-        } catch (e) { }
-        persistSkip();
-        dismiss();
+        runUpdateDownload(newVersion, overlay);
       };
+    }
+
+    // runUpdateDownload swaps the update dialog's body for a progress
+    // bar, streams the asset through /api/update/download, and on
+    // completion triggers a same-page Save As via a Blob URL.
+    async function runUpdateDownload(newVersion, overlay) {
+      var modal = overlay && overlay.querySelector('.modal');
+      var progressHTML = ''
+        + '<h2 style="margin-top:0">' + esc((t('update_downloading') || 'Downloading {v}…').replace('{v}', newVersion)) + '</h2>'
+        + '<div style="background:var(--bg-soft,#222);height:10px;border-radius:5px;overflow:hidden;margin-bottom:8px">'
+        + '  <div id="updateProgressBar" style="background:var(--accent,#4caf50);height:100%;width:0%;transition:width .2s"></div>'
+        + '</div>'
+        + '<div id="updateProgressText" style="font-size:12px;color:var(--text-dim);text-align:center">0 / ?</div>'
+        + '<div class="modal-actions" style="margin-top:14px;justify-content:flex-end">'
+        + '  <button class="btn btn-flat" id="updateCancel">' + esc(t('cancel') || 'Cancel') + '</button>'
+        + '</div>';
+      if (modal) modal.innerHTML = progressHTML;
+
+      var controller = new AbortController();
+      document.getElementById('updateCancel').onclick = function () {
+        controller.abort();
+        if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      };
+
+      var bar = document.getElementById('updateProgressBar');
+      var txt = document.getElementById('updateProgressText');
+
+      var fmtBytes = function (n) {
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        return (n / 1024 / 1024).toFixed(2) + ' MB';
+      };
+
+      try {
+        var resp = await fetch('/api/update/download?version=' + encodeURIComponent(newVersion), {
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          var errText = await resp.text();
+          throw new Error(errText || ('HTTP ' + resp.status));
+        }
+        var total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+        var filename = resp.headers.get('X-Download-Filename') || ('thefeed-' + newVersion);
+
+        var blob;
+        if (resp.body && resp.body.getReader) {
+          var reader = resp.body.getReader();
+          var chunks = [];
+          var received = 0;
+          while (true) {
+            var step = await reader.read();
+            if (step.done) break;
+            chunks.push(step.value);
+            received += step.value.length;
+            if (total > 0) {
+              var pct = Math.min(100, (received / total) * 100);
+              if (bar) bar.style.width = pct.toFixed(1) + '%';
+              if (txt) txt.textContent = fmtBytes(received) + ' / ' + fmtBytes(total)
+                + ' (' + pct.toFixed(0) + '%)';
+            } else {
+              if (txt) txt.textContent = fmtBytes(received);
+            }
+          }
+          blob = new Blob(chunks, { type: 'application/octet-stream' });
+        } else {
+          // Fallback for old WebViews without ReadableStream. No
+          // progress — just wait for the whole response, then save.
+          if (txt) txt.textContent = (t('update_downloading_no_progress') || 'Downloading (no progress on this browser)…');
+          if (bar) bar.style.width = '100%';
+          blob = await resp.blob();
+        }
+
+        if (androidBridge && androidBridge.saveMedia) {
+          // Android WebView ignores <a download> for blob URLs — route
+          // through the native bridge so the file lands in Downloads/.
+          if (txt) txt.textContent = (t('update_saving') || 'Saving to Downloads…');
+          var b64 = await blobToBase64(blob);
+          androidBridge.saveMedia(b64, 'application/octet-stream', filename);
+        } else {
+          var blobURL = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = blobURL;
+          a.download = filename;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(function () { URL.revokeObjectURL(blobURL); }, 60000);
+        }
+
+        if (txt) txt.textContent = (t('update_saved') || 'Saved') + ': ' + filename;
+        try {
+          var sk = 'thefeed_skip_gh_update_' + normalizeVersion(newVersion);
+          localStorage.setItem(sk, '1');
+        } catch (e) { }
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skipUpdateVersion: newVersion })
+        }).catch(function () { });
+
+        setTimeout(function () {
+          if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        }, 1500);
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        if (txt) {
+          txt.style.color = 'var(--danger,#e53935)';
+          txt.textContent = (t('update_download_failed') || 'Download failed') + ': ' + (e.message || e);
+        }
+        showToast((t('update_download_failed') || 'Download failed') + ': ' + (e.message || e));
+      }
     }
 
     async function checkLatestVersion() {

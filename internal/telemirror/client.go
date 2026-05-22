@@ -23,10 +23,10 @@ const (
 	requestTimeout     = 20 * time.Second
 )
 
-// fingerprint identifies a TLS ClientHello shape. The Iranian DPI fails
-// to match Go's stock fingerprint; we have to mimic something it
-// already permits. We try multiple presets per request because we
-// can't know in advance which one is currently whitelisted.
+// fingerprint identifies a TLS ClientHello shape. Restrictive DPI
+// systems fail to match Go's stock fingerprint; we have to mimic
+// something they already permit. We try multiple presets per request
+// because we can't know in advance which one is currently whitelisted.
 type fingerprint struct {
 	name string
 	id   utls.ClientHelloID
@@ -63,10 +63,10 @@ type proxyAttempt struct {
 	tl  string
 }
 
-// SNI host used for domain fronting. The user confirmed www.google.com
-// is whitelisted in Iran while translate.google.com / t-me.translate.goog
-// might not be — fronting via www.google.com is the only path that
-// passes TLS-SNI inspection.
+// SNI host used for domain fronting. www.google.com is widely
+// reachable from restricted networks while translate.google.com /
+// t-me.translate.goog may be filtered — fronting via www.google.com
+// is the only path that passes TLS-SNI inspection on those networks.
 const frontSNI = "www.google.com"
 
 var proxyAttempts = []proxyAttempt{
@@ -265,8 +265,8 @@ func presetSpec(id utls.ClientHelloID) (*utls.ClientHelloSpec, error) {
 // nodeTLS12Spec is a ClientHelloSpec that mimics Node.js with
 // `secureProtocol: 'TLSv1_2_method'` plus the exact cipher list from
 // teleMirror's createCustomAgent. TLS 1.2 only — no supported_versions
-// extension, no TLS 1.3 hints. The Iranian DPI seems to allow this
-// shape because Node's OpenSSL produces it.
+// extension, no TLS 1.3 hints. Restrictive DPI systems seem to allow
+// this shape because Node's OpenSSL produces it.
 func nodeTLS12Spec() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
