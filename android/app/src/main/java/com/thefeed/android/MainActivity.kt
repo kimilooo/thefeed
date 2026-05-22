@@ -332,26 +332,31 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Polls SharedPreferences for the port on every attempt, then probes the URL.
-     * This handles force-kill restarts where the service picks a new port:
-     * the loop follows the port change automatically instead of hammering a stale one.
+     * Polls SharedPreferences for the port on every attempt, then probes
+     * the URL. Status text stays hidden for the first QUIET_ATTEMPTS so
+     * the common in-process-gomobile case (server up in <1 s) doesn't
+     * flash a counter at the user. Only slow starts or outright failures
+     * surface a message.
      */
     private fun waitForServerThenLoad() {
-        setStatus("Waiting for service...")
+        setStatus("")
         Thread {
             var ready = false
             var lastPort = -1
             for (attempt in 1..MAX_PROBE_ATTEMPTS) {
                 val port = getCurrentPort()
                 if (port <= 0) {
-                    handler.post { setStatus("Waiting for service... ($attempt/$MAX_PROBE_ATTEMPTS)") }
+                    if (attempt > QUIET_ATTEMPTS) {
+                        handler.post { setStatus("Waiting for service... ($attempt/$MAX_PROBE_ATTEMPTS)") }
+                    }
                     Thread.sleep(PROBE_INTERVAL_MS)
                     continue
                 }
                 if (port != lastPort) {
-                    // Service restarted with a new port — reset and start fresh
                     lastPort = port
-                    handler.post { setStatus("Connecting...") }
+                    if (attempt > QUIET_ATTEMPTS) {
+                        handler.post { setStatus("Connecting...") }
+                    }
                 }
                 try {
                     val conn = URL("http://127.0.0.1:$port").openConnection() as HttpURLConnection
@@ -369,7 +374,9 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     // Connection refused — not ready yet
                 }
-                handler.post { setStatus("Waiting for server... ($attempt/$MAX_PROBE_ATTEMPTS)") }
+                if (attempt > QUIET_ATTEMPTS) {
+                    handler.post { setStatus("Waiting for server... ($attempt/$MAX_PROBE_ATTEMPTS)") }
+                }
                 Thread.sleep(PROBE_INTERVAL_MS)
             }
             if (!ready) {
@@ -394,6 +401,10 @@ class MainActivity : ComponentActivity() {
         private const val PROBE_INTERVAL_MS = 1000L   // 1s between probes → up to 30s total
         private const val PROBE_TIMEOUT_MS  = 1000L   // 1s HTTP connect timeout per probe
         private const val RETRY_DELAY_MS    = 2000L   // delay before restarting probe cycle on error
+        // Suppress the "Waiting…" counter for the first N probes — with
+        // in-process gomobile the server is up in <1 s and showing a
+        // counter for that brief window just looks broken.
+        private const val QUIET_ATTEMPTS    = 3
         private const val PREF_BATTERY_OPT_DECLINED = "battery_opt_declined"
     }
 }
