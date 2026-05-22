@@ -6324,6 +6324,23 @@
       if (_renderChannelsTimer) clearTimeout(_renderChannelsTimer);
       _renderChannelsTimer = setTimeout(_renderChannelsNow, 50);
     }
+    
+    function getPinnedChannels() {
+      try { return JSON.parse(localStorage.getItem('pinned_channels')) || []; } catch (e) { return []; }
+    }
+    function togglePinChannel(channelName, event) {
+      if (event) event.stopPropagation();
+      var pinned = getPinnedChannels();
+      var idx = pinned.indexOf(channelName);
+      if (idx !== -1) {
+        pinned.splice(idx, 1);
+      } else {
+        pinned.push(channelName);
+      }
+      try { localStorage.setItem('pinned_channels', JSON.stringify(pinned)); } catch(e) {}
+      renderChannels();
+    }
+    
     function _renderChannelsNow() {
       _renderChannelsTimer = null;
       var el = document.getElementById('channelList');
@@ -6331,21 +6348,34 @@
         var _hint = resolverScanHint || (t('no_channels_hint') + ' <button onclick="jumpToLog()" style="background:none;border:none;cursor:pointer;font-size:13px;vertical-align:middle;padding:0 2px">&#128220;</button> ' + t('no_channels_hint2'));
         el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim);font-size:13px">' + t('no_channels') + '<br><span id="no-ch-hint" style="font-size:11px;opacity:.7;line-height:1.8">' + _hint + '</span></div>'; return
       }
+      
+      var pinned = getPinnedChannels();
       // Fast-path: if channel count matches existing items, just update classes/badges
       var existingItems = el.querySelectorAll('.ch-item');
       if (existingItems.length === channels.length) {
         var needsFullRebuild = false;
+        // Also rebuild if sort order has changed based on pin state
+        var expectedOrder = channels.slice().map(function(c, i) { return { c: c, i: i }; }).sort(function(a, b) {
+          var aPinned = pinned.includes(a.c.Name || a.c.name);
+          var bPinned = pinned.includes(b.c.Name || b.c.name);
+          if (aPinned && !bPinned) return -1;
+          if (!aPinned && bPinned) return 1;
+          return a.i - b.i;
+        });
+        
         for (var ci = 0; ci < channels.length; ci++) {
-          var ch = channels[ci], nm = ch.Name || ch.name || 'Channel ' + (ci + 1);
+          var ch = expectedOrder[ci].c;
+          var nm = ch.Name || ch.name || 'Channel ' + (expectedOrder[ci].i + 1);
           var lbl = ch.DisplayName || ch.displayName || nm;
           if (existingItems[ci].dataset.name !== nm || existingItems[ci].dataset.label !== lbl) { needsFullRebuild = true; break }
         }
         if (!needsFullRebuild) {
           for (var ui = 0; ui < channels.length; ui++) {
-            var num = ui + 1;
+            var origIdx = expectedOrder[ui].i;
+            var num = origIdx + 1;
             existingItems[ui].classList.toggle('active', num === selectedChannel);
-            var chNm = channels[ui].Name || channels[ui].name || '';
-            var showBadge = channelHasNew(channels[ui]) && num !== selectedChannel;
+            var chNm = channels[origIdx].Name || channels[origIdx].name || '';
+            var showBadge = channelHasNew(channels[origIdx]) && num !== selectedChannel;
             var previewEl = existingItems[ui].querySelector('.ch-preview');
             if (previewEl) previewEl.innerHTML = showBadge ? '<span class="ch-badge">NEW</span>' : '';
             var autoBtn = existingItems[ui].querySelector('.ch-autoupdate');
@@ -6353,10 +6383,17 @@
               var key = chNm.replace(/^@/, '').trim();
               autoBtn.classList.toggle('on', autoUpdateChannels.has(key));
             }
+            // Update pin button if present
+            var pinBtn = existingItems[ui].querySelector('.ch-pin');
+            if (pinBtn) {
+              var isPinned = pinned.includes(chNm);
+              pinBtn.classList.toggle('active', isPinned);
+              pinBtn.innerHTML = isPinned ? '📌' : '📍';
+            }
             // Avatar diff against profilePicCache. Without this the
             // fast path skips avatar updates and SSE-driven reloads
             // don't reach the UI.
-            var ct2 = channels[ui].ChatType || channels[ui].chatType || 0;
+            var ct2 = channels[origIdx].ChatType || channels[origIdx].chatType || 0;
             var isX2 = ct2 === 2;
             var bareHandle2 = chNm.replace(/^@/, '').toLowerCase();
             if (isX2 && bareHandle2.indexOf('x/') === 0) bareHandle2 = bareHandle2.substring(2);
@@ -6394,6 +6431,23 @@
         else if (ct === 1) privs.push({ ch: c, idx: i });
         else pubs.push({ ch: c, idx: i });
       }
+      
+      // Sort helper for sections
+      function sortSection(items) {
+        items.sort(function(a, b) {
+           var nmA = a.ch.Name || a.ch.name || '';
+           var nmB = b.ch.Name || b.ch.name || '';
+           var pinA = pinned.includes(nmA);
+           var pinB = pinned.includes(nmB);
+           if (pinA && !pinB) return -1;
+           if (!pinA && pinB) return 1;
+           return a.idx - b.idx;
+        });
+      }
+      sortSection(pubs);
+      sortSection(privs);
+      sortSection(xposts);
+      
       function section(title, items) {
         if (!items.length) return ''; var h = '';
         if (title) h += '<div class="channel-section-title">' + esc(title) + '</div>';
@@ -6429,6 +6483,10 @@
           h += '<div class="ch-info"><div class="ch-name">' + formatTitleWithFlag(label) + (isPriv ? '<span class="ch-type-tag">' + t('private') + '</span>' : (isX ? '<span class="ch-type-tag x-tag">' + t('x_label') + '</span>' : '')) + '</div>';
           if (chSubText) h += '<div class="ch-sub">' + esc(chSubText) + '</div>';
           h += '<div class="ch-preview">' + badge + '</div></div>';
+          
+          var isPinned = pinned.includes(handle);
+          h += '<button type="button" class="ch-pin ' + (isPinned ? 'active' : '') + '" style="background:none;border:none;cursor:pointer;font-size:16px;opacity:' + (isPinned ? '1' : '0.4') + '" onclick="togglePinChannel(\'' + escAttr(handle) + '\', event)">' + (isPinned ? '📌' : '📍') + '</button>';
+          
           var autoKey = handle.replace(/^@/, '').trim();
           var autoOn = autoUpdateChannels.has(autoKey);
           var autoTitle = esc(t('auto_update_toggle') || 'Auto-update this channel');
